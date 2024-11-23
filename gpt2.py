@@ -1,3 +1,4 @@
+import time
 from tqdm.auto import tqdm
 import math
 from transformers import GPT2LMHeadModel, pipeline, set_seed
@@ -7,14 +8,13 @@ import torch.nn as nn
 import torch
 import torch.nn.functional as F
 from dataclasses import dataclass
-import matplotlib.pyplot as plt
 
 if torch.cuda.is_available():
-    device = torch.device("cuda")
+    device = "cuda"
 elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-    device = torch.device("mps")
+    device = "mps"
 else:
-    device = torch.device("cpu")
+    device = "cpu"
 
 # device = torch.device("cpu")
 
@@ -227,22 +227,26 @@ class GPT(nn.Module):
 # model = GPT.from_pretrained("gpt2")
 config = GPTConfig()
 model = GPT(config).to(device)
+model = torch.compile(model)
 
-
-train_loader = DataLoader(B=4, T=config.block_size)
+train_loader = DataLoader(B=16, T=config.block_size)
 optimizer = optim.AdamW(model.parameters(), lr=3e-4)
 
-for i in tqdm(range(10)):
+for i in range(50):
+    t0 = time.time()
     x, y = train_loader.next_batch()
-    logits, loss = model(x, y)
     optimizer.zero_grad()
+    with torch.autocast(device_type=device, dtype=torch.bfloat16):
+        logits, loss = model(x, y)
     loss.backward()
     optimizer.step()
-    if i % 10000 == 0:
-        print(f"Loss: {loss.item()}")
+    torch.cuda.synchronize()
+    t1 = time.time()
+    dt = (t1 - t0) * 1000
+    tps = train_loader.B * train_loader.T/(t1 - t0)
+    print(f"Step {i} | Loss: {loss.item()} | dt: {dt}ms | TPS: {tps} tok/sec")
 
-print(f"Loss: {loss.item()}")
-
+'''
 num_return_sequences = 5
 max_new_tokens = 30
 enc = tiktoken.get_encoding("gpt2")
@@ -255,4 +259,4 @@ output_texts = [
     enc.decode(output_tokens[i].tolist()) for i in range(num_return_sequences)
 ]
 for text in output_texts:
-    print(">", text)
+    print(">", text)'''
