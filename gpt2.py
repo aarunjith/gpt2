@@ -271,18 +271,28 @@ config = GPTConfig(vocab_size=50304)
 model = GPT(config).to(device)
 model = torch.compile(model)
 
-train_loader = DataLoader(B=16, T=config.block_size)
+total_batch_size = 524288
+micro_batch_size = 16
+assert total_batch_size % (micro_batch_size * config.block_size) == 0, "Ensure Total Batch Size is divisible by B * T"
+grad_accum_steps = total_batch_size // (micro_batch_size * config.block_size)
+print(f'Desired batch size : {total_batch_size}')
+print(f'Gradient Accumulation Steps: {grad_accum_steps}')
+train_loader = DataLoader(B=micro_batch_size, T=config.block_size)
 optimizer = model.configure_optimizers(0.1, 6e-4, device)
 lr_config = LRSchedulerConfig(max_lr=6e-4)
 
 
 for step in range(lr_config.max_steps):
     t0 = time.time()
-    x, y = train_loader.next_batch()
     optimizer.zero_grad()
-    with torch.autocast(device_type=device, dtype=torch.bfloat16):
-        logits, loss = model(x, y)
-    loss.backward()
+    loss_accum = 0.0
+    for _ in range(grad_accum_steps):
+        x, y = train_loader.next_batch()
+        with torch.autocast(device_type=device, dtype=torch.bfloat16):
+            logits, loss = model(x, y)
+        loss /= grad_accum_steps
+        loss_accum += loss.detach()
+        loss.backward()
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     lr = get_lr(step, lr_config)
     for param_group in optimizer.param_groups:
@@ -292,7 +302,7 @@ for step in range(lr_config.max_steps):
     t1 = time.time()
     dt = (t1 - t0) * 1000
     tps = train_loader.B * train_loader.T/(t1 - t0)
-    print(f"Step {step} | LR : {lr:.4f} | Loss: {loss.item():.6f} | norm: {norm.item():.4f} | dt: {dt}ms | TPS: {tps:.4f} tok/sec")
+    print(f"Step {step} | LR : {lr:.6f} | Loss: {loss_accum:.6f} | norm: {norm.item():.4f} | dt: {dt}ms | TPS: {tps:.4f} tok/sec")
 
 '''
 num_return_sequences = 5
