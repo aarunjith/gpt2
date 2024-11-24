@@ -1,3 +1,4 @@
+import inspect
 import time
 from tqdm.auto import tqdm
 import math
@@ -27,6 +28,22 @@ class GPTConfig:
     vocab_size: int = 50257
     block_size: int = 1024
 
+@dataclass
+class LRSchedulerConfig:
+    max_lr: float = 3e-4
+    min_lr: float = max_lr * 0.1
+    warmup_steps: int = 10
+    max_steps: int = 50
+
+def get_lr(step, config):
+    if step < config.warmup_steps:
+        return config.max_lr*(step+1)/config.warmup_steps
+    if step > config.max_steps:
+        return config.min_lr
+    decay_ratio = (step - config.warmup_steps)/(config.max_steps - config.warmup_steps)
+    assert 0 <= decay_ratio <= 1
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
+    return config.min_lr + coeff * (config.max_lr - config.min_lr)
 
 class DataLoader:
     def __init__(self, B, T):
@@ -228,6 +245,26 @@ class GPT(nn.Module):
                     sd[k].copy_(sd_hf[k])
         return model
 
+    # Implement Weight Decay
+    def configure_optimizers(self, weight_decay, learning_rate, device):
+        param_dict = {pn: p for pn,p in self.named_parameters()}
+        param_dict = {pn: p for pn,p in param_dict.items() if p.requires_grad}
+        # Weight decay only 2D params or above, dont decay batchnorm/ bias etc
+        decay_params = [p for n,p in param_dict.items() if p.dim() >= 2]
+        nodecay_params = [p for n,p in param_dict.items() if p.dim() < 2]
+        optim_groups = [
+                {'params': decay_params, 'weight_decay': weight_decay},
+                {'params': nodecay_params, 'weight_decay': 0.0},
+        ]
+        num_decay_params = sum(p.numel() for p in decay_params)
+        num_nodecay_params = sum(p.numel() for p in nodecay_params)
+        print(f'Decayed Parameters : {num_decay_params}')
+        print(f'Not Decayed Parameters : {num_nodecay_params}')
+        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+        use_fused = fused_available and 'cuda' in device
+        print(f'Fused AdamW : {use_fused}')
+        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8)
+        return optimizer
 
 # model = GPT.from_pretrained("gpt2")
 config = GPTConfig(vocab_size=50304)
@@ -235,9 +272,11 @@ model = GPT(config).to(device)
 model = torch.compile(model)
 
 train_loader = DataLoader(B=16, T=config.block_size)
-optimizer = optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
+optimizer = model.configure_optimizers(0.1, 6e-4, device)
+lr_config = LRSchedulerConfig(max_lr=6e-4)
 
-for i in range(50):
+
+for step in range(lr_config.max_steps):
     t0 = time.time()
     x, y = train_loader.next_batch()
     optimizer.zero_grad()
@@ -245,12 +284,15 @@ for i in range(50):
         logits, loss = model(x, y)
     loss.backward()
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    lr = get_lr(step, lr_config)
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
     optimizer.step()
     torch.cuda.synchronize()
     t1 = time.time()
     dt = (t1 - t0) * 1000
     tps = train_loader.B * train_loader.T/(t1 - t0)
-    print(f"Step {i} | Loss: {loss.item():.6f} | norm: {norm.item():.4f} | dt: {dt}ms | TPS: {tps:.4f} tok/sec")
+    print(f"Step {step} | LR : {lr:.4f} | Loss: {loss.item():.6f} | norm: {norm.item():.4f} | dt: {dt}ms | TPS: {tps:.4f} tok/sec")
 
 '''
 num_return_sequences = 5
