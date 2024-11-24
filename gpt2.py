@@ -87,7 +87,9 @@ class CausalSelfAttention(nn.Module):
         att = F.softmax(att, dim=-1)
         y = att @ v
         '''
+        # Flash Attention
         y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         y = self.c_proj(y)
         return y
@@ -228,12 +230,12 @@ class GPT(nn.Module):
 
 
 # model = GPT.from_pretrained("gpt2")
-config = GPTConfig()
+config = GPTConfig(vocab_size=50304)
 model = GPT(config).to(device)
 model = torch.compile(model)
 
 train_loader = DataLoader(B=16, T=config.block_size)
-optimizer = optim.AdamW(model.parameters(), lr=3e-4)
+optimizer = optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
 
 for i in range(50):
     t0 = time.time()
@@ -242,12 +244,13 @@ for i in range(50):
     with torch.autocast(device_type=device, dtype=torch.bfloat16):
         logits, loss = model(x, y)
     loss.backward()
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     optimizer.step()
     torch.cuda.synchronize()
     t1 = time.time()
     dt = (t1 - t0) * 1000
     tps = train_loader.B * train_loader.T/(t1 - t0)
-    print(f"Step {i} | Loss: {loss.item()} | dt: {dt}ms | TPS: {tps} tok/sec")
+    print(f"Step {i} | Loss: {loss.item():.6f} | norm: {norm.item():.4f} | dt: {dt}ms | TPS: {tps:.4f} tok/sec")
 
 '''
 num_return_sequences = 5
