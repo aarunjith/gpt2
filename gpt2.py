@@ -11,7 +11,7 @@ import torch.nn.functional as F
 from dataclasses import dataclass
 import torch.distributed as dist
 from torch.distributed import init_process_group, destroy_process_group
-from torch.distributed import DistributedDataParallel as DDP
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 ddp = int(os.environ.get("RANK", -1)) != -1
 if ddp:
@@ -283,6 +283,7 @@ model = GPT(config).to(device)
 model = torch.compile(model)
 if ddp:
     model = DDP(model, device_ids=[ddp_local_rank])
+raw_model = model.module if ddp else model
 
 total_batch_size = 524288
 micro_batch_size = 16
@@ -293,7 +294,7 @@ if master_process:
     print(f'Gradient Accumulation Steps: {grad_accum_steps}')
 
 train_loader = DataLoader(B=micro_batch_size, T=config.block_size, process_rank=ddp_local_rank, num_processes=world_size)
-optimizer = model.configure_optimizers(0.1, 6e-4, device)
+optimizer = raw_model.configure_optimizers(0.1, 6e-4, device)
 lr_config = LRSchedulerConfig(max_lr=6e-4)
 
 
@@ -304,7 +305,7 @@ for step in range(lr_config.max_steps):
     for i in range(grad_accum_steps):
         x, y = train_loader.next_batch()
         with torch.autocast(device_type=device, dtype=torch.bfloat16):
-            logits, loss = model(x, y)
+            logits, loss = raw_model(x, y)
         loss /= grad_accum_steps # Scale the loss by the number of gradient accumulation steps
         loss_accum += loss.detach()
         if ddp: # Only sync gradients at the last step
